@@ -1,14 +1,19 @@
-use std::sync::Arc;
+use std::{
+    env,
+    sync::{Arc, LazyLock},
+};
 
+use anyhow::anyhow;
 use pb::tunnel_client::TunnelClient;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinSet,
+    try_join,
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::{Streaming, transport::Channel};
@@ -20,7 +25,9 @@ pub mod pb {
     tonic::include_proto!("tunnel");
 }
 
-const PORTS: &[u32] = &[8080];
+const PORTS: &[u32] = &[8080, 8006];
+static HOST: LazyLock<String> =
+    LazyLock::new(|| env::var("HOST").unwrap_or("127.0.0.1".to_string()));
 
 type SharedTunnel = Arc<Mutex<TunnelClient<Channel>>>;
 
@@ -31,44 +38,64 @@ async fn handle_port(client: SharedTunnel, port: u32) -> anyhow::Result<()> {
         .listen(Port { port })
         .await?
         .into_inner();
+    let mut j = JoinSet::new();
     while let Some(c) = listen_stream.next().await {
         match c {
             Err(e) => {
-                error!("Proxy failed to listen to port {port}: {e}");
+                error!("server error: {e}");
             }
             Ok(c) => {
+                info!("received connection request to uuid {}", c.uuid);
                 let client = client.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connect(client, &c.uuid, port).await {
+                j.spawn(async move {
+                    if let Err(e) = handle_connect(client, c, port).await {
                         error!("{e}");
                     }
                 });
             }
         }
     }
+    j.join_all().await;
     Ok(())
 }
 
-async fn handle_connect(client: SharedTunnel, uuid: &str, port: u32) -> anyhow::Result<()> {
+async fn handle_connect(client: SharedTunnel, connect: Connect, _port: u32) -> anyhow::Result<()> {
     let (send, recv) = mpsc::channel(128);
-    let (tcp_read, tcp_write) = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await?
-        .into_split();
+    let addr = format!("{}:8000", *HOST);
+    let (tcp_read, tcp_write) = TcpStream::connect(&addr).await?.into_split();
+    info!("connected to {addr}");
     let stream = ReceiverStream::from(recv);
 
-    let temp = client
+    let server_stream = client
         .lock()
         .await
         .create_tunnel(stream)
         .await?
         .into_inner();
 
+    info!("tunnel established");
+
+    let (set_signal, signal) = oneshot::channel::<()>();
+    let pipe1 = {
+        let send = send.clone();
+        async move {
+            signal.await?;
+            pipe_to_proxy(tcp_read, send).await
+        }
+    };
+
+    let pipe2 = pipe_to_connection(tcp_write, server_stream);
+
     send.send(TunnelInfo {
-        r#type: Some(Type::Connect(Connect {
-            uuid: uuid.to_string(),
-        })),
+        r#type: Some(Type::Connect(connect.clone())),
     })
     .await?;
+    info!("sent connection header to uuid {}", connect.uuid);
+    set_signal
+        .send(())
+        .map_err(|_| anyhow!("this should not happen"))?;
+    info!("started forwarding to uuid {}", connect.uuid);
+    try_join!(pipe1, pipe2)?;
     Ok(())
 }
 
@@ -77,7 +104,6 @@ async fn pipe_to_proxy(
     send: mpsc::Sender<TunnelInfo>,
 ) -> anyhow::Result<()> {
     let mut buf = [0; 1024];
-    let mut tcp_read = BufReader::new(tcp_read);
     loop {
         let bytes_read = tcp_read.read(&mut buf).await?;
         let data = &buf[..bytes_read];
@@ -96,7 +122,6 @@ async fn pipe_to_connection(
     mut tcp_send: OwnedWriteHalf,
     mut recv: Streaming<Packet>,
 ) -> anyhow::Result<()> {
-    let mut tcp_send = BufWriter::new(tcp_send);
     while let Some(p) = recv.next().await {
         let data = p?.data;
         tcp_send.write_all(&data).await?;
@@ -114,91 +139,8 @@ async fn main() -> anyhow::Result<()> {
     ));
     let mut j = JoinSet::new();
     for p in PORTS {
-        j.spawn({
-            let client = client.clone();
-            async move {
-                let temp = client.lock().await.listen(Port { port: *p }).await;
-                match temp {
-                    Err(_e) => (),
-                    Ok(s) => {
-                        let mut s = s.into_inner();
-                        while let Some(Ok(c)) = s.next().await {
-                            tokio::spawn({
-                                let client = client.clone();
-                                let (send, recv) = mpsc::channel::<TunnelInfo>(128);
-                                let stream = ReceiverStream::from(recv);
-                                async move {
-                                    let temp = client.lock().await.create_tunnel(stream).await;
-                                    match temp {
-                                        Err(_e) => {}
-                                        Ok(r) => {
-                                            let tcp =
-                                                TcpStream::connect(format!("127.0.0.1:8000")).await;
-                                            match tcp {
-                                                Err(_e) => {}
-                                                Ok(t) => {
-                                                    let (mut tcp_read, mut tcp_write) =
-                                                        t.into_split();
-                                                    let _ = send
-                                                        .send(TunnelInfo {
-                                                            r#type: Some(Type::Connect(c)),
-                                                        })
-                                                        .await;
-                                                    let mut r = r.into_inner();
-
-                                                    tokio::spawn({
-                                                        let send = send.clone();
-                                                        async move {
-                                                            let mut buf = [0; 1024];
-                                                            loop {
-                                                                let temp =
-                                                                    tcp_read.read(&mut buf).await;
-                                                                match temp {
-                                                                    Ok(0) => break,
-                                                                    Err(_e) => break,
-                                                                    Ok(n) => {
-                                                                        info!("received {n} bytes from external server");
-                                                                        let data = &buf[..n];
-                                                                        match send.send(TunnelInfo {
-                                                                            r#type: Some(
-                                                                                Type::Packet(
-                                                                                    Packet {
-                                                                                        data: data
-                                                                                            .into(),
-                                                                                    },
-                                                                                ),
-                                                                            ),
-                                                                        })
-                                                                        .await {
-                                                                            Err(_e) => break,
-                                                                            Ok(_)=> continue
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    });
-                                                    while let Some(Ok(p)) = r.next().await {
-                                                        info!(
-                                                            "received {} bytes from proxy server",
-                                                            p.data.len()
-                                                        );
-                                                        match tcp_write.write_all(&p.data).await {
-                                                            Err(_e) => break,
-                                                            Ok(_) => continue,
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    }
-                }
-            }
-        });
+        let client = client.clone();
+        j.spawn(handle_port(client, *p));
     }
     j.join_all().await;
     Ok(())
