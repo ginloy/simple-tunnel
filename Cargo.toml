@@ -1,0 +1,21 @@
+[package]
+name = "simple-tunnel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+futures = "0.3.31"
+prost = "0.14.1"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-stream = "0.1.17"
+tonic = "0.14.2"
+tonic-prost = "0.14.2"
+tonic-reflection = "0.14.2"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.20"
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[build-dependencies]
+anyhow = "1.0.100"
+tonic-prost-build = "0.14.2"

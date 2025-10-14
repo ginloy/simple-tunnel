@@ -1,0 +1,26 @@
+syntax = "proto3";
+package tunnel;
+
+message Port {
+  uint32 port = 1;
+}
+
+message Connect {
+  string uuid = 1;
+}
+
+message Packet {
+  bytes data = 1;
+}
+
+message TunnelInfo {
+  oneof type {
+    Connect connect = 1;
+    Packet packet = 2;
+  }
+}
+
+service Tunnel {
+  rpc Listen(Port) returns (stream Connect) {}
+  rpc CreateTunnel(stream TunnelInfo) returns (stream Packet) {}
+}
