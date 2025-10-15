@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use pb::tunnel_client::TunnelClient;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -11,9 +11,9 @@ use tokio::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Mutex, mpsc, oneshot},
+    select,
+    sync::{Mutex, mpsc},
     task::JoinSet,
-    try_join,
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::{Streaming, transport::Channel};
@@ -75,13 +75,9 @@ async fn handle_connect(client: SharedTunnel, connect: Connect, _port: u32) -> a
 
     info!(address = addr, "tunnel established");
 
-    let (set_signal, signal) = oneshot::channel::<()>();
     let pipe1 = {
         let send = send.clone();
-        async move {
-            signal.await?;
-            pipe_to_proxy(tcp_read, send).await
-        }
+        async move { pipe_to_proxy(tcp_read, send).await }
     };
 
     let pipe2 = pipe_to_connection(tcp_write, server_stream);
@@ -91,11 +87,11 @@ async fn handle_connect(client: SharedTunnel, connect: Connect, _port: u32) -> a
     })
     .await?;
     info!(uuid = connect.uuid, "sent connection header");
-    set_signal
-        .send(())
-        .map_err(|_| anyhow!("this should not happen"))?;
     info!(uuid = connect.uuid, "started forwarding");
-    try_join!(pipe1, pipe2)?;
+    select! {
+        r = pipe1 => r?,
+        r = pipe2 => r?
+    }
     Ok(())
 }
 
@@ -108,6 +104,7 @@ async fn pipe_to_proxy(
         let bytes_read = tcp_read.read(&mut buf).await?;
         let data = &buf[..bytes_read];
         if bytes_read == 0 {
+            info!(address = ?tcp_read.peer_addr(), "EOF reached");
             break;
         }
         send.send(TunnelInfo {
@@ -126,6 +123,7 @@ async fn pipe_to_connection(
         let data = p?.data;
         tcp_send.write_all(&data).await?;
     }
+    info!(address = ?tcp_send.peer_addr(), "EOF reached");
     Ok(())
 }
 

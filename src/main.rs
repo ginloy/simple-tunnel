@@ -7,9 +7,9 @@ use anyhow::anyhow;
 use anyhow::bail;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::select;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex, mpsc};
-use tokio::try_join;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Server;
@@ -154,7 +154,10 @@ impl MyTunnel {
             }
             Ok(())
         };
-        try_join!(read_task, write_task)?;
+        select! {
+            r = read_task => r?,
+            r = write_task => r?
+        }
         Ok(())
     }
 }
