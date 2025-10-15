@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use pb::tunnel_client::TunnelClient;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -42,14 +42,14 @@ async fn handle_port(client: SharedTunnel, port: u32) -> anyhow::Result<()> {
     while let Some(c) = listen_stream.next().await {
         match c {
             Err(e) => {
-                error!("server error: {e}");
+                error!(error = ?e, "server error");
             }
             Ok(c) => {
-                info!("received connection request to uuid {}", c.uuid);
+                info!(uuid = c.uuid, "received connection request");
                 let client = client.clone();
                 j.spawn(async move {
                     if let Err(e) = handle_connect(client, c, port).await {
-                        error!("{e}");
+                        error!(error = ?e, "tunnel error");
                     }
                 });
             }
@@ -63,7 +63,7 @@ async fn handle_connect(client: SharedTunnel, connect: Connect, _port: u32) -> a
     let (send, recv) = mpsc::channel(128);
     let addr = format!("{}:8000", *HOST);
     let (tcp_read, tcp_write) = TcpStream::connect(&addr).await?.into_split();
-    info!("connected to {addr}");
+    info!(address = addr, "connected");
     let stream = ReceiverStream::from(recv);
 
     let server_stream = client
@@ -73,7 +73,7 @@ async fn handle_connect(client: SharedTunnel, connect: Connect, _port: u32) -> a
         .await?
         .into_inner();
 
-    info!("tunnel established");
+    info!(address = addr, "tunnel established");
 
     let (set_signal, signal) = oneshot::channel::<()>();
     let pipe1 = {
@@ -90,11 +90,11 @@ async fn handle_connect(client: SharedTunnel, connect: Connect, _port: u32) -> a
         r#type: Some(Type::Connect(connect.clone())),
     })
     .await?;
-    info!("sent connection header to uuid {}", connect.uuid);
+    info!(uuid = connect.uuid, "sent connection header");
     set_signal
         .send(())
         .map_err(|_| anyhow!("this should not happen"))?;
-    info!("started forwarding to uuid {}", connect.uuid);
+    info!(uuid = connect.uuid, "started forwarding");
     try_join!(pipe1, pipe2)?;
     Ok(())
 }
@@ -134,9 +134,8 @@ async fn main() -> anyhow::Result<()> {
     let subscriber = tracing_subscriber::FmtSubscriber::new();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let client = Arc::new(Mutex::new(
-        TunnelClient::connect("http://127.0.0.1:50051").await?,
-    ));
+    let server = env::var("SERVER_ADDR").context("SERVER_ADDR not set")?;
+    let client = Arc::new(Mutex::new(TunnelClient::connect(server).await?));
     let mut j = JoinSet::new();
     for p in PORTS {
         let client = client.clone();

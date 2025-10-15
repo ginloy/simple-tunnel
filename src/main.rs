@@ -2,20 +2,25 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, stdout};
+use anyhow::Context;
+use anyhow::anyhow;
+use anyhow::bail;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex, mpsc};
+use tokio::try_join;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Server;
-use tonic::{Response, Status};
+use tonic::{Response, Status, Streaming};
+use tracing::warn;
 use tracing::{error, info};
 use tunnel::tunnel_server::Tunnel;
 use uuid::Uuid;
 
 use crate::tunnel::tunnel_info::Type;
-use crate::tunnel::{Connect, Packet};
+use crate::tunnel::{Connect, Packet, TunnelInfo};
 
 pub mod tunnel {
     tonic::include_proto!("tunnel");
@@ -38,38 +43,118 @@ impl MyTunnel {
         send: Sender<Result<Connect, Status>>,
     ) -> anyhow::Result<()> {
         let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+        info!(port, "listening");
 
         let mut active_connections = Vec::new();
-        while !send.is_closed() {
+        loop {
             let c_map = c_map.clone();
-            match listener.accept().await {
-                Err(e) => {
-                    error!("failed to listen on port {port}: {e}");
-                }
-                Ok((tcp_stream, addr)) => {
-                    info!("connection incoming from {addr}");
-                    let uuid = Uuid::new_v4();
-                    c_map.lock().await.insert(uuid, tcp_stream);
-                    active_connections.push(uuid);
-                    tokio::spawn({
-                        let send = send.clone();
-                        async move {
-                            if let Err(e) = send
-                                .send(Ok(Connect {
-                                    uuid: uuid.to_string(),
-                                }))
-                                .await
-                            {
-                                error!("broken stream with agent: {e}");
-                            }
+            tokio::select! {
+                _ = send.closed() => {
+                    warn!(port, "broken stream with agent");
+                    break;
+                },
+                r = listener.accept() => {
+                    match r {
+                        Err(e) => {
+                            error!(port, error = ?e, "failed to accept connection");
                         }
-                    });
+                        Ok((tcp_stream, addr)) => {
+                            info!(address = ?addr, "connection incoming");
+                            let uuid = Uuid::new_v4();
+                            c_map.lock().await.insert(uuid, tcp_stream);
+                            active_connections.push(uuid);
+                            tokio::spawn({
+                                let send = send.clone();
+                                async move {
+                                    if let Err(e) = send
+                                        .send(Ok(Connect {
+                                            uuid: uuid.to_string(),
+                                        }))
+                                        .await
+                                    {
+                                        error!(error = ?e, "broken stream with agent");
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
             }
         }
+        let mut c_map = c_map.lock().await;
         for c in active_connections {
-            c_map.lock().await.remove(&c);
+            c_map.remove(&c);
         }
+        Ok(())
+    }
+
+    async fn handle_tunnel_create(
+        c_map: ConnectionMap,
+        send: Sender<Result<Packet, Status>>,
+        mut recv: Streaming<TunnelInfo>,
+    ) -> anyhow::Result<()> {
+        let Some(Ok(TunnelInfo {
+            r#type: Some(Type::Connect(c)),
+        })) = recv.next().await
+        else {
+            bail!("invalid first message, connection info missing");
+        };
+        let uuid =
+            Uuid::parse_str(&c.uuid).with_context(|| format!("failed to parse uuid {}", c.uuid))?;
+        let tcp_stream = c_map
+            .lock()
+            .await
+            .remove(&uuid)
+            .context(format!("connection with uuid {uuid} does not exist"))?;
+        let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+        let read_task = async move {
+            let mut buf = [0; 1024];
+            loop {
+                match tcp_read.read(&mut buf).await {
+                    Ok(0) => {
+                        info!("connection {uuid} EOF reached, ending connection");
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        send.send(Ok(Packet { data: data.into() }))
+                            .await
+                            .with_context(|| format!("connection {uuid} broken tunnel"))?;
+                    }
+                    Err(e) => bail!(
+                        anyhow!(e).context(format!("connection {uuid} failed to read tcp stream"))
+                    ),
+                };
+            }
+            Ok(())
+        };
+        let write_task = async move {
+            while let Some(r) = recv.next().await {
+                match r {
+                    Ok(TunnelInfo {
+                        r#type: Some(Type::Packet(p)),
+                    }) => {
+                        let data = p.data;
+                        tcp_write.write_all(&data).await.with_context(|| {
+                            format!("connection {uuid} error writing to tcp stream")
+                        })?;
+                    }
+                    Ok(TunnelInfo {
+                        r#type: Some(Type::Connect(_)),
+                    }) => {
+                        bail!(
+                            "connection {uuid} invalid message from tunnel, expected packet, received connect"
+                        );
+                    }
+                    Ok(TunnelInfo { r#type: None }) => {
+                        bail!("connection {uuid} missing message from tunnel");
+                    }
+                    Err(e) => bail!(anyhow!(e)),
+                }
+            }
+            Ok(())
+        };
+        try_join!(read_task, write_task)?;
         Ok(())
     }
 }
@@ -90,7 +175,7 @@ impl Tunnel for MyTunnel {
         let c_map = self.connection_map.clone();
         tokio::spawn(async move {
             if let Err(e) = Self::handle_listen(c_map, port, send).await {
-                error!("{e:?}");
+                error!(port, error = ?e , "listen error");
             }
         });
 
@@ -107,96 +192,10 @@ impl Tunnel for MyTunnel {
         info!("received tunnel creation request");
         let (send, recv) = mpsc::channel(128);
         let ret = ReceiverStream::from(recv);
-        tokio::spawn({
-            let c_map = self.connection_map.clone();
-            async move {
-                let mut stream_from_client = request.into_inner();
-                let head = stream_from_client.message().await;
-                match head {
-                    Ok(Some(x)) => match x.r#type {
-                        Some(Type::Connect(c)) => {
-                            info!("client stream established");
-                            let uuid = Uuid::parse_str(&c.uuid);
-                            match uuid {
-                                Err(e) => {
-                                    error!("invalid uuid {} provided", c.uuid);
-                                    send.send(Err(Status::invalid_argument(format!(
-                                        "invalid uuid {} provided",
-                                        c.uuid
-                                    ))))
-                                    .await;
-                                }
-                                Ok(i) => {
-                                    let tcp_stream = c_map.lock().await.remove(&i);
-                                    match tcp_stream {
-                                        None => {
-                                            let msg =
-                                                format!("connection with uuid {i} does not exist");
-                                            error!(msg);
-                                            send.send(Err(Status::invalid_argument(msg))).await;
-                                        }
-                                        Some(tcp_stream) => {
-                                            let (mut tcp_recv, mut tcp_write) =
-                                                tcp_stream.into_split();
-
-                                            tokio::spawn(async move {
-                                                let mut buf = [0; 1024];
-                                                loop {
-                                                    let temp = tcp_recv.read(&mut buf).await;
-                                                    match temp {
-                                                        Ok(0) => break,
-                                                        Err(_e) => break,
-                                                        Ok(n) => {
-                                                            info!(
-                                                                "received {n} bytes from external connection"
-                                                            );
-                                                            let data = &buf[..n];
-                                                            stdout().write_all(data).await;
-                                                            if let Err(e) = send
-                                                                .send(Ok(Packet {
-                                                                    data: data.into(),
-                                                                }))
-                                                                .await
-                                                            {
-                                                                error!(
-                                                                    "failed to send data to client, closing connection: {e}"
-                                                                );
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                            while let Some(Ok(x)) = stream_from_client.next().await
-                                            {
-                                                match x.r#type {
-                                                    Some(Type::Packet(p)) => {
-                                                        info!(
-                                                            "received {} bytes from client",
-                                                            &p.data.len()
-                                                        );
-                                                        if let Err(e) = {
-                                                            stdout().write_all(&p.data).await;
-                                                            tcp_write.write_all(&p.data).await
-                                                        } {
-                                                            error!(
-                                                                "failed to send data to external connection, closing connections: {e}"
-                                                            );
-                                                            break;
-                                                        }
-                                                    }
-                                                    _ => break,
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
+        let c_map = self.connection_map.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Self::handle_tunnel_create(c_map, send, request.into_inner()).await {
+                error!(error = ?e, "tunnel error");
             }
         });
         Ok(Response::new(Box::pin(ret)))
@@ -211,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
     let service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(tunnel::FILE_DESCRIPTOR_SET)
         .build_v1()?;
-    let addr = "127.0.0.1:50051".parse()?;
+    let addr = "0.0.0.0:50051".parse()?;
     let tunnel_service = MyTunnel {
         connection_map: Arc::new(Mutex::new(HashMap::new())),
     };
